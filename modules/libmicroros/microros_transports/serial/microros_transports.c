@@ -1,104 +1,115 @@
-#include <uxr/client/transport.h>
+/*
+ * micro-ROS custom transport over USB CDC ACM for Zephyr 4.3
+ * Compatible with micro-ROS Humble
+ */
 
 #include <microros_transports.h>
-#include <version.h>
+#include <uxr/client/transport.h>
 
-#if ZEPHYR_VERSION_CODE >= ZEPHYR_VERSION(3,1,0)
-#include <zephyr/kernel.h>
 #include <zephyr/device.h>
-#include <zephyr/sys/printk.h>
 #include <zephyr/drivers/uart.h>
-#include <zephyr/sys/ring_buffer.h>
+#include <zephyr/kernel.h>
 #include <zephyr/posix/unistd.h>
-#else
-#include <zephyr.h>
-#include <device.h>
-#include <sys/printk.h>
-#include <drivers/uart.h>
-#include <sys/ring_buffer.h>
-#include <posix/unistd.h>
-#endif
+#include <zephyr/sys/printk.h>
+#include <zephyr/sys/ring_buffer.h>
 
-#include <stdio.h>
-#include <string.h>
-#include <stdbool.h>
+/* -------------------------------------------------------------------------- */
+/* Configuration                                                              */
+/* -------------------------------------------------------------------------- */
 
 #define RING_BUF_SIZE 2048
-#define UART_NODE DT_NODELABEL(usart1)
+#define CDC_ACM_NODE DT_CHOSEN(zephyr_console)
 
-char uart_in_buffer[RING_BUF_SIZE];
-char uart_out_buffer[RING_BUF_SIZE];
+/* -------------------------------------------------------------------------- */
+/* Static data                                                                */
+/* -------------------------------------------------------------------------- */
 
-struct ring_buf out_ringbuf, in_ringbuf;
+static const struct device *cdc_dev;
 
-// --- micro-ROS Serial Transport for Zephyr ---
+static uint8_t usb_rx_buffer[RING_BUF_SIZE];
+static struct ring_buf rx_ringbuf;
 
-static void uart_fifo_callback(const struct device * dev, void * args){
-    while (uart_irq_update(dev) && uart_irq_is_pending(dev)) {
-        if (uart_irq_rx_ready(dev)) {
-            int recv_len;
-            char buffer[64];
-            size_t len = MIN(ring_buf_space_get(&in_ringbuf), sizeof(buffer));
+/* -------------------------------------------------------------------------- */
+/* CDC ACM interrupt callback */
+/* -------------------------------------------------------------------------- */
 
-            if (len > 0){
-                recv_len = uart_fifo_read(dev, buffer, len);
-                ring_buf_put(&in_ringbuf, buffer, recv_len);
-            }
+static void cdc_acm_irq_callback(const struct device *dev, void *user_data) {
+  ARG_UNUSED(user_data);
 
-        }
+  while (uart_irq_update(dev) && uart_irq_is_pending(dev)) {
+
+    if (uart_irq_rx_ready(dev)) {
+      uint8_t c;
+
+      /* Drain RX FIFO completely */
+      while (uart_fifo_read(dev, &c, 1) == 1) {
+        ring_buf_put(&rx_ringbuf, &c, 1);
+      }
     }
+  }
 }
 
-bool zephyr_transport_open(struct uxrCustomTransport * transport){
-    zephyr_transport_params_t * params = (zephyr_transport_params_t*) transport->args;
+/* -------------------------------------------------------------------------- */
+/* micro-ROS transport API */
+/* -------------------------------------------------------------------------- */
 
-    params->uart_dev = DEVICE_DT_GET(UART_NODE);
-    if (!params->uart_dev) {
-        printk("Serial device not found\n");
-        return false;
-    }
+bool zephyr_transport_open(struct uxrCustomTransport *transport) {
+  ARG_UNUSED(transport);
 
-    ring_buf_init(&in_ringbuf, sizeof(uart_in_buffer), uart_out_buffer);
+  cdc_dev = DEVICE_DT_GET(CDC_ACM_NODE);
+  if (!device_is_ready(cdc_dev)) {
+    printk("micro-ROS CDC ACM device not ready\n");
+    return false;
+  }
 
-    uart_irq_callback_set(params->uart_dev, uart_fifo_callback);
+  ring_buf_init(&rx_ringbuf, sizeof(usb_rx_buffer), usb_rx_buffer);
 
-    /* Enable rx interrupts */
-    uart_irq_rx_enable(params->uart_dev);
+  uart_irq_callback_set(cdc_dev, cdc_acm_irq_callback);
+  uart_irq_rx_enable(cdc_dev);
 
-    return true;
+  return true;
 }
 
-bool zephyr_transport_close(struct uxrCustomTransport * transport){
-    (void) transport;
-    // TODO: close serial transport here
-    return true;
+bool zephyr_transport_close(struct uxrCustomTransport *transport) {
+  ARG_UNUSED(transport);
+
+  if (cdc_dev != NULL) {
+    uart_irq_rx_disable(cdc_dev);
+  }
+
+  return true;
 }
 
-size_t zephyr_transport_write(struct uxrCustomTransport* transport, const uint8_t * buf, size_t len, uint8_t * err){
-    zephyr_transport_params_t * params = (zephyr_transport_params_t*) transport->args;
+size_t zephyr_transport_write(struct uxrCustomTransport *transport,
+                              const uint8_t *buf, size_t len, uint8_t *err) {
+  ARG_UNUSED(transport);
+  ARG_UNUSED(err);
 
-    for (size_t i = 0; i < len; i++)
-    {
-        uart_poll_out(params->uart_dev, buf[i]);
-    }
+  /* CDC ACM uses polling TX */
+  for (size_t i = 0; i < len; i++) {
+    uart_poll_out(cdc_dev, buf[i]);
+  }
 
-    return len;
+  return len;
 }
 
-size_t zephyr_transport_read(struct uxrCustomTransport* transport, uint8_t* buf, size_t len, int timeout, uint8_t* err){
-    zephyr_transport_params_t * params = (zephyr_transport_params_t*) transport->args;
+size_t zephyr_transport_read(struct uxrCustomTransport *transport, uint8_t *buf,
+                             size_t len, int timeout, uint8_t *err) {
+  ARG_UNUSED(transport);
+  ARG_UNUSED(err);
 
-    size_t read = 0;
-    int spent_time = 0;
+  size_t read = 0;
+  int waited_ms = 0;
 
-    while(ring_buf_is_empty(&in_ringbuf) && spent_time < timeout){
-        usleep(1000);
-        spent_time++;
-    }
+  /* Timeout is in milliseconds */
+  while (ring_buf_is_empty(&rx_ringbuf) && waited_ms < timeout) {
+    usleep(1000);
+    waited_ms++;
+  }
 
-    uart_irq_rx_disable(params->uart_dev);
-    read = ring_buf_get(&in_ringbuf, buf, len);
-    uart_irq_rx_enable(params->uart_dev);
+  unsigned int key = irq_lock();
+  read = ring_buf_get(&rx_ringbuf, buf, len);
+  irq_unlock(key);
 
-    return read;
+  return read;
 }
